@@ -1,0 +1,231 @@
+#!/bin/sh
+# git-sync: one-way Git branch copier.
+# Only fast-forward updates are allowed. Scheduling is the caller's job.
+# POSIX sh, Git, awk, mkdir, date, and ordinary Unix tools are required.
+set -eu
+umask 077
+
+usage() {
+    cat <<'EOF'
+Usage:
+  git-sync run --source URL --target URL [--branch B] [--dry-run]
+  git-sync run --repo PATH --source-remote NAME --target-remote NAME [--branch B] [--dry-run]
+  git-sync add --name NAME [source and target options]
+  git-sync run --job NAME [--dry-run]
+  git-sync run --all [--dry-run]
+  git-sync list
+  git-sync remove --name NAME
+Options: --source-branch B --target-branch B --config-dir PATH --state-dir PATH
+EOF
+}
+config=$HOME/.config/git-sync
+state=$HOME/.local/state/git-sync
+name='' job='' src='' dst='' repo='' sr='' dr='' sb='' db='' dry=no batch=no log='' lock=''
+fail() {
+    code=$1; shift
+    printf '%s\n' "ERROR $*" >&2
+    if [ -n "$log" ]; then printf '%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ') ERROR $*" >> "$log"; fi
+    exit "$code"
+}
+event() {
+    line="$(date -u '+%Y-%m-%dT%H:%M:%SZ') job=$job $*"
+    printf '%s\n' "$line" >&2
+    printf '%s\n' "$line" >> "$log"
+}
+check_name() {
+    case "$1" in ''|.*|*[!A-Za-z0-9._-]*) fail 2 "invalid job name" ;; esac
+}
+check_branch() {
+    git check-ref-format "refs/heads/$1" >/dev/null 2>&1 || fail 2 "invalid branch $1"
+}
+resolve() {
+    if [ -n "$repo" ]; then
+        [ -z "$src$dst" ] || fail 2 "use remote names OR URLs"
+        [ -n "$sr" ] && [ -n "$dr" ] || fail 2 "both remote names required"
+        src=$(git -C "$repo" remote get-url "$sr") || fail 2 "bad source remote"
+        dst=$(git -C "$repo" remote get-url "$dr") || fail 2 "bad target remote"
+    fi
+    [ -n "$src" ] && [ -n "$dst" ] && [ "$src" != "$dst" ] || fail 2 "invalid source/target"
+    case "$src" in -*) fail 2 "invalid source" ;; esac
+    case "$dst" in -*) fail 2 "invalid target" ;; esac
+    if [ -z "$sb" ]; then
+        heads=$(GIT_TERMINAL_PROMPT=0 git ls-remote --symref "$src" HEAD) || fail 5 "cannot detect source HEAD"
+        sb=$(printf '%s\n' "$heads" | awk '$1=="ref:" && $3=="HEAD" {sub(/^refs\/heads\//,"",$2);print $2;exit}')
+    fi
+    [ -n "$sb" ] || fail 2 "pass --source-branch"
+    [ -n "$db" ] || db=$sb
+    check_branch "$sb"
+    check_branch "$db"
+}
+save_job() {
+    check_name "$name"
+    mkdir -p "$config/jobs" || fail 5 "cannot create config"
+    dest=$config/jobs/$name
+    [ ! -e "$dest" ] || fail 2 "job exists"
+    tmp=$config/jobs/.new-$name-$$
+    mkdir "$tmp" || fail 5 "cannot stage job"
+    printf '%s\n' "$src" > "$tmp/source"
+    printf '%s\n' "$dst" > "$tmp/target"
+    printf '%s\n' "$sb" > "$tmp/source_branch"
+    printf '%s\n' "$db" > "$tmp/target_branch"
+    mv "$tmp" "$dest" || fail 5 "cannot save job"
+    printf 'saved %s\n' "$name"
+}
+load_job() {
+    check_name "$job"
+    dir=$config/jobs/$job
+    [ -d "$dir" ] || fail 2 "job not found"
+    for field in source target source_branch target_branch; do
+        [ -f "$dir/$field" ] || fail 2 "missing job field $field"
+    done
+    src=$(cat "$dir/source")
+    dst=$(cat "$dir/target")
+    sb=$(cat "$dir/source_branch")
+    db=$(cat "$dir/target_branch")
+    [ -n "$src" ] && [ -n "$dst" ] && [ "$src" != "$dst" ] || fail 2 "bad saved URLs"
+    check_branch "$sb"
+    check_branch "$db"
+}
+release() {
+    if [ -n "$lock" ] && [ -d "$lock" ]; then
+        rm -f "$lock/pid"
+        rmdir "$lock" 2>/dev/null || :
+    fi
+}
+prepare() {
+    check_name "$job"
+    mkdir -p "$state/cache" "$state/logs" "$state/locks" || fail 5 "cannot create state"
+    log=$state/logs/$job.log
+    lock=$state/locks/$job.lock
+    if ! mkdir "$lock" 2>/dev/null; then
+        lock=''
+        fail 6 "lock exists (running or stale)"
+    fi
+    printf '%s\n' "$$" > "$lock/pid"
+    trap 'release' 0
+    trap 'exit 130' 2
+    trap 'exit 143' 15
+}
+git_step() {
+    stage=$1; shift
+    if ! GIT_TERMINAL_PROMPT=0 git "$@" >> "$log" 2>&1; then
+        fail 5 "stage=$stage failed; inspect $log"
+    fi
+}
+remote_sha() {
+    # An absent ref produces empty output but ls-remote still exits zero.
+    refs=$(GIT_TERMINAL_PROMPT=0 git ls-remote "$1" "refs/heads/$2" 2>> "$log") || return 1
+    printf '%s\n' "$refs" | awk '$2 ~ /^refs\/heads\// {print $1;exit}'
+}
+verify() {
+    actual=$(remote_sha "$dst" "$db") || fail 5 "verification failed"
+    [ "$actual" = "$source_sha" ] || fail 5 "VERIFY_FAILED expected=$source_sha actual=$actual"
+}
+sync() {
+    prepare
+    event "START source_branch=$sb target_branch=$db dry_run=$dry"
+    cache=$state/cache/$job.git
+    [ -d "$cache" ] || git_step init init --bare -q "$cache"
+    git_step fetch_source --git-dir="$cache" fetch -q --no-tags "$src" "+refs/heads/$sb:refs/git-sync/source"
+    source_sha=$(git --git-dir="$cache" rev-parse refs/git-sync/source)
+    target_sha=$(remote_sha "$dst" "$db") || fail 5 "target lookup failed"
+    if [ -z "$target_sha" ]; then
+        heads=$(GIT_TERMINAL_PROMPT=0 git ls-remote --heads "$dst" 2>> "$log") || fail 5 "target heads lookup failed"
+        [ -z "$heads" ] || fail 3 "target branch missing in nonempty repo"
+        if [ "$dry" = yes ]; then event "DRY_RUN new branch $db"; return; fi
+        git_step push --git-dir="$cache" push -q "$dst" "$source_sha:refs/heads/$db"
+        verify
+        event "SYNCED new branch sha=$source_sha"
+        return
+    fi
+    git_step fetch_target --git-dir="$cache" fetch -q --no-tags "$dst" "+refs/heads/$db:refs/git-sync/target"
+    fetched=$(git --git-dir="$cache" rev-parse refs/git-sync/target)
+    [ "$fetched" = "$target_sha" ] || fail 5 "target moved during fetch"
+    if [ "$source_sha" = "$target_sha" ]; then event "NOOP sha=$source_sha"; return; fi
+    if git --git-dir="$cache" merge-base --is-ancestor "$target_sha" "$source_sha"; then
+        event "FAST_FORWARD from=$target_sha to=$source_sha"
+        if [ "$dry" = yes ]; then event "DRY_RUN no push"; return; fi
+        # A regular push refuses non-fast-forward changes from another writer.
+        git_step push --git-dir="$cache" push -q "$dst" "$source_sha:refs/heads/$db"
+        verify
+        event "SYNCED sha=$source_sha"
+        return
+    else
+        status=$?
+        [ "$status" -eq 1 ] || fail 5 "ancestry check failed"
+    fi
+    if git --git-dir="$cache" merge-base --is-ancestor "$source_sha" "$target_sha"; then
+        fail 3 "TARGET_AHEAD source=$source_sha target=$target_sha"
+    else
+        status=$?
+        [ "$status" -eq 1 ] || fail 5 "ancestry check failed"
+    fi
+    fail 4 "DIVERGED source=$source_sha target=$target_sha"
+}
+
+[ $# -gt 0 ] || { usage; exit 2; }
+action=$1; shift
+case "$action" in add|run|list|remove) ;; -h|--help) usage; exit 0 ;; *) usage >&2; exit 2 ;; esac
+while [ $# -gt 0 ]; do
+    flag=$1
+    case "$flag" in
+        --name|--job|--source|--target|--repo|--source-remote|--target-remote|--source-branch|--target-branch|--branch|--config-dir|--state-dir)
+            [ $# -ge 2 ] || fail 2 "missing $flag"
+            value=$2; shift 2
+            case "$flag" in
+                --name) name=$value ;; --job) job=$value ;;
+                --source) src=$value ;; --target) dst=$value ;;
+                --repo) repo=$value ;; --source-remote) sr=$value ;;
+                --target-remote) dr=$value ;;
+                --source-branch) sb=$value ;; --target-branch) db=$value ;;
+                --branch) sb=$value; db=$value ;;
+                --config-dir) config=$value ;; --state-dir) state=$value ;;
+            esac ;;
+        --dry-run) dry=yes; shift ;;
+        --all) batch=yes; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) fail 2 "unknown option $flag" ;;
+    esac
+done
+case "$action" in
+    add)
+        [ -n "$name" ] || fail 2 "add requires --name"
+        resolve; save_job ;;
+    list)
+        for dir in "$config"/jobs/*; do
+            [ -d "$dir" ] || continue
+            printf '%s %s -> %s\n' "$(basename "$dir")" "$(cat "$dir/source_branch")" "$(cat "$dir/target_branch")"
+        done ;;
+    remove)
+        check_name "$name"
+        [ -d "$config/jobs/$name" ] || fail 2 "job not found"
+        [ ! -d "$state/locks/$name.lock" ] || fail 6 "job locked"
+        rm -r "$config/jobs/$name"
+        printf 'removed %s; logs retained\n' "$name" ;;
+    run)
+        if [ "$batch" = yes ]; then
+            failures=0; found=no
+            for dir in "$config"/jobs/*; do
+                [ -d "$dir" ] || continue
+                found=yes; item=$(basename "$dir")
+                if [ "$dry" = yes ]; then
+                    "$0" run --job "$item" --dry-run --config-dir "$config" --state-dir "$state" || failures=$((failures + 1))
+                else
+                    "$0" run --job "$item" --config-dir "$config" --state-dir "$state" || failures=$((failures + 1))
+                fi
+            done
+            [ "$found" = yes ] || fail 2 "no jobs"
+            printf 'finished; failed_jobs=%s\n' "$failures"
+            [ "$failures" -eq 0 ] || exit 1
+        elif [ -n "$job" ]; then
+            load_job; sync
+        else
+            resolve
+            job=$name
+            if [ -z "$job" ]; then
+                hash=$(printf '%s\n' "$src" "$dst" "$sb" "$db" | git hash-object --stdin)
+                job=adhoc-$hash
+            fi
+            sync
+        fi ;;
+esac
